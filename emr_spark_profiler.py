@@ -38,6 +38,8 @@ import logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger("py4j").setLevel(logging.ERROR)
+logging.getLogger("databricks").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
@@ -47,13 +49,13 @@ logger = logging.getLogger(__name__)
 dbutils.widgets.text("aws_region", "us-east-1", "AWS Region")
 dbutils.widgets.text("emr_cluster_arn", "", "EMR Cluster ARN (optional - leave blank to discover clusters)")
 dbutils.widgets.text("timeout_seconds", "300", "Request Timeout (seconds)")
-dbutils.widgets.text("max_applications", "50", "Max Applications to Analyze per Cluster")
+dbutils.widgets.text("max_applications", "10", "Max Applications to Analyze per Cluster")
 dbutils.widgets.dropdown("environment", "dev", ["dev", "prod"], "Environment (dev/prod)")
 dbutils.widgets.text("s3_output_path", "", "S3 Output Path (prod only)")
 dbutils.widgets.text("custom_hours_threshold", "", "Normalized instance hours threshold (optional)")
 dbutils.widgets.dropdown("cluster_states", "TERMINATED,WAITING", ["TERMINATED", "WAITING", "TERMINATED,WAITING", "ALL"], "EMR Cluster States to Analyze")
 dbutils.widgets.text("cluster_name_filter", "", "Cluster Name Filter (optional - partial name match)")
-dbutils.widgets.text("max_clusters", "5", "Max Clusters to Analyze")
+dbutils.widgets.text("max_clusters", "50", "Max Clusters to Analyze")
 dbutils.widgets.text("created_after_date", "", "EMR Clusters Created After (YYYY-MM-DD)")
 dbutils.widgets.text("created_before_date", "", "EMR Clusters Created Before (YYYY-MM-DD)")
 dbutils.widgets.text("persistent_ui_timeout_seconds", "180", "Persistent App UI Timeout (seconds)")
@@ -81,34 +83,28 @@ BATCH_DELAY_SECONDS = int(dbutils.widgets.get("batch_delay_seconds") or "60")
 MAX_ENDPOINT_FAILURES = int(dbutils.widgets.get("max_endpoint_failures") or "3")
 
 # Date parameters handling
-if ENVIRONMENT == "dev":
-    CREATED_AFTER_DATE_STR = dbutils.widgets.get("created_after_date").strip()
-    CREATED_BEFORE_DATE_STR = dbutils.widgets.get("created_before_date").strip()
+CREATED_AFTER_DATE_STR = dbutils.widgets.get("created_after_date").strip()
+CREATED_BEFORE_DATE_STR = dbutils.widgets.get("created_before_date").strip()
 
-    PARSED_CREATED_AFTER_DATE = None
-    if CREATED_AFTER_DATE_STR:
-        try:
-            PARSED_CREATED_AFTER_DATE = datetime.datetime.strptime(CREATED_AFTER_DATE_STR, "%Y-%m-%d")
-        except ValueError as e:
-            logger.error("❌ Invalid format for created_after_date: %s. Expected YYYY-MM-DD.", CREATED_AFTER_DATE_STR, exc_info=True)
-            raise ValueError(f"Invalid format for created_after_date: {CREATED_AFTER_DATE_STR}. Expected YYYY-MM-DD.") from e
+PARSED_CREATED_AFTER_DATE = None
+if CREATED_AFTER_DATE_STR:
+    try:
+        PARSED_CREATED_AFTER_DATE = datetime.datetime.strptime(CREATED_AFTER_DATE_STR, '%Y-%m-%d')
+    except ValueError as e:
+        logger.error("Invalid format for created_after_date: %s. Expected YYYY-MM-DD.", CREATED_AFTER_DATE_STR, exc_info=True)
+        raise ValueError(f"Invalid format for created_after_date: {CREATED_AFTER_DATE_STR}. Expected YYYY-MM-DD.") from e
 
-    PARSED_CREATED_BEFORE_DATE = None
-    if CREATED_BEFORE_DATE_STR:
-        try:
-            PARSED_CREATED_BEFORE_DATE = datetime.datetime.strptime(CREATED_BEFORE_DATE_STR, "%Y-%m-%d") + timedelta(days=1, seconds=-1)
-        except ValueError as e:
-            logger.error("❌ Invalid format for created_before_date: %s. Expected YYYY-MM-DD.", CREATED_BEFORE_DATE_STR, exc_info=True)
-            raise ValueError(f"Invalid format for created_before_date: {CREATED_BEFORE_DATE_STR}. Expected YYYY-MM-DD.") from e
+PARSED_CREATED_BEFORE_DATE = None
+if CREATED_BEFORE_DATE_STR:
+    try:
+        PARSED_CREATED_BEFORE_DATE = datetime.datetime.strptime(CREATED_BEFORE_DATE_STR, '%Y-%m-%d') + timedelta(days=1, seconds=-1)
+    except ValueError as e:
+        logger.error("Invalid format for created_before_date: %s. Expected YYYY-MM-DD.", CREATED_BEFORE_DATE_STR, exc_info=True)
+        raise ValueError(f"Invalid format for created_before_date: {CREATED_BEFORE_DATE_STR}. Expected YYYY-MM-DD.") from e
 
-    if PARSED_CREATED_AFTER_DATE and PARSED_CREATED_BEFORE_DATE and PARSED_CREATED_AFTER_DATE >= PARSED_CREATED_BEFORE_DATE:
-        logger.error("❌ created_after_date (%s) cannot be on or after created_before_date (%s).", CREATED_AFTER_DATE_STR, CREATED_BEFORE_DATE_STR, exc_info=True)
-        raise ValueError("created_after_date cannot be on or after created_before_date.")
-else:
-    PARSED_CREATED_BEFORE_DATE = datetime.datetime.now()
-    PARSED_CREATED_AFTER_DATE = PARSED_CREATED_BEFORE_DATE - timedelta(days=1)
-    CREATED_AFTER_DATE_STR = PARSED_CREATED_AFTER_DATE.strftime("%Y-%m-%d")
-    CREATED_BEFORE_DATE_STR = PARSED_CREATED_BEFORE_DATE.strftime("%Y-%m-%d")
+if PARSED_CREATED_AFTER_DATE and PARSED_CREATED_BEFORE_DATE and PARSED_CREATED_AFTER_DATE >= PARSED_CREATED_BEFORE_DATE:
+    logger.error("created_after_date (%s) cannot be on or after created_before_date (%s).", CREATED_AFTER_DATE_STR, CREATED_BEFORE_DATE_STR, exc_info=True)
+    raise ValueError("created_after_date cannot be on or after created_before_date.")
 
 # Parse cluster states
 if CLUSTER_STATES == "ALL":
@@ -126,6 +122,62 @@ else:
 # Output versioning in prod
 TODAY_STR = date.today().isoformat()
 OUTPUT_RUN_PATH = f"{S3_OUTPUT_PATH.rstrip('/')}/{TODAY_STR}" if ENVIRONMENT == "prod" and S3_OUTPUT_PATH else S3_OUTPUT_PATH
+
+# SHS Retry Configuration
+SHS_RETRY_CONFIG = {
+    "retry_settings": {
+        "max_retries": 3,
+        "initial_delay_seconds": 5.0,
+        "max_delay_seconds": 120.0,
+        "backoff_factor": 2.0,
+        "enable_jitter": True,
+        "jitter_max": 1.0
+    },
+    "timeout_settings": {
+        "connection_timeout": 30,
+        "read_timeout": 180,
+        "total_timeout": 300
+    },
+    "throttling_settings": {
+        "request_delay_seconds": 1.0,
+        "enable_adaptive_throttling": True,
+        "consecutive_error_threshold": 5,
+        "adaptive_delay_multiplier": 1.5
+    },
+    "spark_history_server_errors": {
+        "retryable_http_codes": [429, 500, 502, 503, 504],
+        "non_retryable_codes": [400, 401, 403, 404],
+        "connection_errors": ["ConnectionError", "Timeout", "HTTPError"]
+    },
+    "endpoint_specific_settings": {
+        "stages": {
+            "max_retries": 2,
+            "read_timeout": 600
+        },
+        "jobs": {
+            "max_retries": 2,
+            "read_timeout": 600
+        },
+        "sql": {
+            "max_retries": 2,
+            "read_timeout": 600
+        },
+        "executors": {
+            "max_retries": 2,
+            "read_timeout": 300
+        },
+        "applications": {
+            "max_retries": 2,
+            "read_timeout": 300
+        }
+    },
+    "logging": {
+        "enable_retry_logging": True,
+        "enable_success_logging": True,
+        "enable_throttle_logging": True,
+        "log_shs_url": True
+    }
+}
 
 # Log final configuration
 print("Configuration:")
@@ -424,7 +476,8 @@ class EMRClusterDiscovery:
                 'cluster_name': cluster.get('Name'),
                 'cluster_arn': cluster.get('ClusterArn'),
                 'status': cluster.get('Status', {}).get('State'),
-                'applications': [app.get('Name') for app in cluster.get('Applications', [])]
+                'applications': [app.get('Name') for app in cluster.get('Applications', [])],
+                'normalized_instance_hours': cluster.get('NormalizedInstanceHours', 0)
             }
 
             # Instance metadata: try InstanceGroups, fall back to InstanceFleets
@@ -512,6 +565,7 @@ class EMRClusterDiscovery:
 
 # DBTITLE 1,SHS REST Interactions
 import json
+import random
 import time
 from typing import List, Any, Dict, Optional
 import requests
@@ -529,106 +583,170 @@ class SparkHistoryServerClient:
         :param base_url: Base URL for the Spark History Server.
         :param session: Configured HTTP session with authentication.
         """
+        if not base_url or not isinstance(base_url, str):
+            raise ValueError("base_url must be a non-empty string.")
+        if not isinstance(session, requests.Session):
+            raise TypeError("session must be a requests.Session object.")
+            
         self.base_url = base_url
         self.session = session
         self.api_base = f"{base_url}/api/v1"
+        self.retry_config = SHS_RETRY_CONFIG
+        self.consecutive_errors = {}  # Track consecutive errors per endpoint
+        self.last_request_time = 0  # For throttling
 
-        # Circuit-breaker state
-        self._endpoint_failure_counts: Dict[str, int] = {}
-        self._max_endpoint_failures: int = 3
-        self._failed_endpoints: set[str] = set()
+    def _calculate_jitter(self, delay: float) -> float:
+        """Calculate jitter for backoff delay."""
+        if not self.retry_config["retry_settings"]["enable_jitter"]:
+            return delay
+        
+        jitter_max = self.retry_config["retry_settings"]["jitter_max"]
+        jitter = random.uniform(0, jitter_max)
+        return delay + jitter
 
-    # ----- Circuit breaker helpers -----
-
-    def _endpoint_key(self, endpoint_or_key: Any) -> str:
-        """
-        Normalize a REST path or logical key to a base endpoint key.
-        Always returns a string suitable for dict keys.
-        """
-        e = str(endpoint_or_key) if endpoint_or_key is not None else ''
-        if 'taskSummary' in e:
-            return 'task_summaries'
-        if 'taskList' in e:
-            return 'tasks'
-        if '/stages' in e:
-            return 'stages'
-        if '/jobs' in e:
-            return 'jobs'
-        if '/sql' in e:
+    def _get_endpoint_type(self, endpoint: str) -> str:
+        """Extract endpoint type from endpoint path for configuration lookup."""
+        if '/sql' in endpoint:
             return 'sql'
-        if 'allexecutors' in e:
+        elif '/stages' in endpoint:
+            return 'stages'
+        elif '/jobs' in endpoint:
+            return 'jobs'
+        elif '/allexecutors' in endpoint:
             return 'executors'
-        if e.startswith('applications'):
+        elif 'applications' in endpoint and not any(x in endpoint for x in ['/jobs', '/stages', '/sql', '/allexecutors']):
             return 'applications'
-        parts = [p for p in e.strip('/').split('/') if p]
-        return parts[-1] if parts else 'unknown'
+        else:
+            return 'default'
 
+    def _apply_throttling(self, endpoint_type: str):
+        """Apply throttling based on configuration and consecutive errors."""
+        config = self.retry_config
+        throttling = config["throttling_settings"]
+        
+        # Base request delay
+        base_delay = throttling["request_delay_seconds"]
+        
+        # Adaptive throttling based on consecutive errors
+        if throttling["enable_adaptive_throttling"]:
+            consecutive_errors = self.consecutive_errors.get(endpoint_type, 0)
+            if consecutive_errors >= throttling["consecutive_error_threshold"]:
+                adaptive_delay = base_delay * (throttling["adaptive_delay_multiplier"] ** (consecutive_errors - throttling["consecutive_error_threshold"] + 1))
+                base_delay = min(adaptive_delay, config["retry_settings"]["max_delay_seconds"])
+                
+                if config["logging"]["enable_throttle_logging"]:
+                    logger.info("Applying adaptive throttling for %s: %d consecutive errors, delay: %.2fs", 
+                              endpoint_type, consecutive_errors, base_delay)
+        
+        # Ensure minimum time between requests
+        time_since_last = time.time() - self.last_request_time
+        if time_since_last < base_delay:
+            sleep_time = base_delay - time_since_last
+            if config["logging"]["enable_throttle_logging"]:
+                logger.info("Throttling request for %s: sleeping %.2fs", endpoint_type, sleep_time)
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
 
-    def should_skip(self, endpoint_or_key: Any) -> bool:
-        """
-        Return True if the endpoint should be skipped due to repeated failures.
-        """
-        key = self._endpoint_key(endpoint_or_key)
-        return self._endpoint_failure_counts.get(key, 0) >= self._max_endpoint_failures
+    def _is_retryable_error(self, exception: Exception) -> bool:
+        """Determine if an error is retryable based on configuration."""
+        error_config = self.retry_config["spark_history_server_errors"]
+        
+        if isinstance(exception, requests.exceptions.HTTPError):
+            status_code = exception.response.status_code
+            if status_code in error_config["non_retryable_codes"]:
+                return False
+            return status_code in error_config["retryable_http_codes"]
+        
+        # Check connection errors
+        exception_name = type(exception).__name__
+        return exception_name in error_config["connection_errors"]
 
-    def record_failure(self, endpoint_or_key: Any) -> None:
+    def _make_request(self, endpoint: str, params: Optional[Dict] = None, max_retries: int = None) -> Any:
         """
-        Record a failure for a specific endpoint key.
-        """
-        key = self._endpoint_key(endpoint_or_key)
-        self._endpoint_failure_counts[key] = self._endpoint_failure_counts.get(key, 0) + 1
-        if self._endpoint_failure_counts[key] >= self._max_endpoint_failures:
-            self._failed_endpoints.add(key)
-            logger.warning("Endpoint '%s' reached failure threshold (%d). Further calls will be skipped.",
-                           key, self._max_endpoint_failures)
+        Make a REST API request with enhanced retry logic based on SHS_RETRY_CONFIG.
 
-    def record_success(self, endpoint_or_key: Any) -> None:
-        """
-        Reset failure count after a success for the endpoint key.
-        """
-        key = self._endpoint_key(endpoint_or_key)
-        self._endpoint_failure_counts[key] = 0
-        if key in self._failed_endpoints:
-            self._failed_endpoints.discard(key)
-
-    # ----- Existing request methods (unchanged behavior) -----
-
-    def _make_request(self, endpoint: str, params: Optional[Dict] = None, max_retries: int = 3) -> Any:
-        """
-        Make a REST API request with retry logic.
+        :param endpoint: The API endpoint to call (e.g., 'applications/app-123/jobs').
+        :param params: A dictionary of query parameters for the request.
+        :param max_retries: Optional override for max retries (uses config if None).
+        :returns: The JSON response from the API.
+        :raises requests.exceptions.RequestException: If the request fails after all retries.
         """
         url = f"{self.api_base}/{endpoint}"
-        if '/sql' in endpoint:
-            timeout = 300
-            logger.info("Using extended timeout (%ss) for SQL endpoint: %s", timeout, endpoint)
-        elif '/stages' in endpoint:
-            timeout = 300
-            logger.info("Using extended timeout (%ss) for stages endpoint: %s", timeout, endpoint)
-        else:
-            timeout = 300
-
+        endpoint_type = self._get_endpoint_type(endpoint)
+        config = self.retry_config
+        
+        # Get endpoint-specific settings
+        endpoint_settings = config["endpoint_specific_settings"].get(endpoint_type, {})
+        
+        # Determine max retries (endpoint-specific > parameter > global config)
+        if max_retries is None:
+            max_retries = endpoint_settings.get("max_retries", config["retry_settings"]["max_retries"])
+        
+        # Determine timeouts
+        connection_timeout = config["timeout_settings"]["connection_timeout"]
+        read_timeout = endpoint_settings.get("read_timeout", config["timeout_settings"]["read_timeout"])
+        timeout = (connection_timeout, read_timeout)
+        
+        if config["logging"]["log_shs_url"] and config["logging"]["enable_retry_logging"]:
+            logger.info("Making request to: %s (endpoint_type: %s, max_retries: %d)", url, endpoint_type, max_retries)
+        
+        # Apply throttling before making request
+        self._apply_throttling(endpoint_type)
+        
         last_exception = None
+        
+        # The retry loop starts with attempt 0 (the first try)
         for attempt in range(max_retries + 1):
             if attempt > 0:
-                wait_time = min(60, 2 ** attempt * 5)
-                logger.info("Retrying %s in %d seconds (attempt %d/%d)...", endpoint, wait_time, attempt + 1, max_retries + 1)
-                time.sleep(wait_time)
+                # Calculate backoff delay with jitter
+                base_delay = config["retry_settings"]["initial_delay_seconds"] * (
+                    config["retry_settings"]["backoff_factor"] ** (attempt - 1)
+                )
+                delay = min(base_delay, config["retry_settings"]["max_delay_seconds"])
+                delay_with_jitter = self._calculate_jitter(delay)
+                
+                if config["logging"]["enable_retry_logging"]:
+                    logger.info("Retrying %s in %.2f seconds (attempt %d/%d)...", 
+                              endpoint, delay_with_jitter, attempt, max_retries)
+                
+                time.sleep(delay_with_jitter)
+
             try:
                 response = self.session.get(url, params=params, timeout=timeout)
-                response.raise_for_status()
+                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+                
+                # Reset consecutive errors on success
+                self.consecutive_errors[endpoint_type] = 0
+                
+                if config["logging"]["enable_success_logging"]:
+                    logger.debug("✅ Successfully retrieved data from %s (attempt %d)", endpoint, attempt + 1)
+                
                 return response.json()
-            except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout, requests.exceptions.HTTPError) as e:
-                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code not in [502, 503, 504]:
-                    logger.error("❌ Non-retryable HTTP error for %s: %s", url, str(e), exc_info=True)
-                    raise
+                
+            except Exception as e:
                 last_exception = e
-                logger.warning("Retryable error on attempt %d for %s: %s", attempt + 1, url, str(e))
-                continue
-            except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-                logger.error("❌ Unhandled exception for %s: %s", url, str(e), exc_info=True)
-                raise
+                
+                # Track consecutive errors for adaptive throttling
+                self.consecutive_errors[endpoint_type] = self.consecutive_errors.get(endpoint_type, 0) + 1
+                
+                # Check if error is retryable
+                if not self._is_retryable_error(e):
+                    if config["logging"]["enable_retry_logging"]:
+                        logger.error("❌ Non-retryable error for %s: %s", url, str(e))
+                    raise e
+                
+                if config["logging"]["enable_retry_logging"]:
+                    logger.warning("Retryable error on attempt %d for %s: %s", attempt + 1, url, str(e))
+                
+                # If this was the last attempt, don't continue
+                if attempt == max_retries:
+                    break
 
-        logger.error("All %d retry attempts failed for %s.", max_retries + 1, url, exc_info=True)
+        # All retries exhausted
+        if config["logging"]["enable_retry_logging"]:
+            logger.error("All %d retry attempts failed for %s.", max_retries + 1, url)
+        
         raise last_exception
 
     def get_applications(self, status: Optional[str] = None, limit: int = 100) -> List[Dict]:
@@ -766,18 +884,53 @@ class SparkMetricsAnalyzer:
         for stage in stages:
             analysis = {
                 'stage_id': stage.get('stageId'),
-                'stage_name': stage.get('name', 'Unknown'),
-                'status': stage.get('status', 'UNKNOWN'),
-                'num_tasks': stage.get('numTasks', 0),
-                'executor_run_time': stage.get('executorRunTime', 0),
-                'input_bytes': stage.get('inputBytes', 0),
-                'output_bytes': stage.get('outputBytes', 0),
-                'shuffle_read_bytes': stage.get('shuffleReadBytes', 0),
-                'shuffle_write_bytes': stage.get('shuffleWriteBytes', 0),
-                'memory_bytes_spilled': stage.get('memoryBytesSpilled', 0),
-                'disk_bytes_spilled': stage.get('diskBytesSpilled', 0),
+                'stage_name': stage.get('name') or 'Unknown',
+                'status': stage.get('status') or 'UNKNOWN',
+                'num_tasks': stage.get('numTasks') or 0,
+                'num_active_tasks': stage.get('numActiveTasks') or 0,
+                'num_complete_tasks': stage.get('numCompleteTasks') or 0,
+                'num_failed_tasks': stage.get('numFailedTasks') or 0,
+                'executor_run_time': stage.get('executorRunTime') or 0,
+                'executor_cpu_time': stage.get('executorCpuTime') or 0,
+                'submission_time': stage.get('submissionTime'),
+                'first_task_launched_time': stage.get('firstTaskLaunchedTime'),
+                'completion_time': stage.get('completionTime'),
+                'input_bytes': stage.get('inputBytes') or 0,
+                'output_bytes': stage.get('outputBytes') or 0,
+                'shuffle_read_bytes': stage.get('shuffleReadBytes') or 0,
+                'shuffle_write_bytes': stage.get('shuffleWriteBytes') or 0,
+                'memory_bytes_spilled': stage.get('memoryBytesSpilled') or 0,
+                'disk_bytes_spilled': stage.get('diskBytesSpilled') or 0,
+                'task_completion_rate': 0.0,
+                'avg_executor_run_time_per_task': 0.0,
+                'total_data_processed_mb': 0.0,
+                'shuffle_data_mb': 0.0,
+                'cluster_id': '',  # Will be populated by caller
+                'cluster_name': '',  # Will be populated by caller
+                'application_id': ''  # Will be populated by caller
             }
+
+            # Calculate efficiency metrics with safe division
+            num_tasks = analysis['num_tasks']
+            num_complete = analysis['num_complete_tasks']
+            executor_run_time = analysis['executor_run_time']
+            
+            if num_tasks > 0:
+                analysis['task_completion_rate'] = round((num_complete / num_tasks) * 100.0, 2)
+                if executor_run_time > 0:
+                    analysis['avg_executor_run_time_per_task'] = round(executor_run_time / num_tasks, 2)
+
+            # Calculate data processing metrics (convert bytes to MB)
+            input_bytes = analysis['input_bytes']
+            output_bytes = analysis['output_bytes']
+            shuffle_read_bytes = analysis['shuffle_read_bytes']
+            shuffle_write_bytes = analysis['shuffle_write_bytes']
+            
+            analysis['total_data_processed_mb'] = round((input_bytes + output_bytes) / (1024 * 1024), 2)
+            analysis['shuffle_data_mb'] = round((shuffle_read_bytes + shuffle_write_bytes) / (1024 * 1024), 2)
+
             stage_analysis.append(analysis)
+
         return stage_analysis
 
     def analyze_task_performance(self, tasks: List[Dict]) -> List[Dict]:
@@ -888,18 +1041,10 @@ class SparkMetricsAnalyzer:
         sql_analysis: List[Dict],
         executors_analysis: List[Dict],
         task_summaries_analysis: List[Dict]
-    ) -> Tuple[Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame]]:
+        ) -> Tuple[Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame], Optional[DataFrame]]:
         """
         Create Spark DataFrames from analysis results with explicit, well-defined schemas.
-
-        :param applications_analysis: Application analysis results.
-        :param jobs_analysis: Job analysis results.
-        :param stages_analysis: Stage analysis results.
-        :param tasks_analysis: Task analysis results.
-        :param sql_analysis: SQL query analysis results.
-        :param executors_analysis: Executor analysis results.
-        :param task_summaries_analysis: Task summary analysis results.
-        :returns: Tuple of DataFrames for each analysis area.
+        This version includes the 'attempt_id' field to uniquely identify data from each application run.
         """
         def create_df(data: List[Dict], schema: StructType, name: str) -> Optional[DataFrame]:
             if not data:
@@ -913,69 +1058,77 @@ class SparkMetricsAnalyzer:
                 logger.error("❌ Failed to create %s DataFrame: %s", name, str(e), exc_info=True)
                 return None
 
-        # Schemas
+        # --- Updated Schemas with attempt_id ---
         applications_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("application_name", StringType(), True),
-            StructField("duration_ms", LongType(), True), StructField("duration_minutes", DoubleType(), True),
-            StructField("start_time", StringType(), True), StructField("end_time", StringType(), True),
-            StructField("spark_version", StringType(), True)
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("application_name", StringType(), True), StructField("duration_ms", LongType(), True),
+            StructField("duration_minutes", DoubleType(), True), StructField("start_time", StringType(), True),
+            StructField("end_time", StringType(), True), StructField("spark_version", StringType(), True)
         ])
         jobs_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("job_id", LongType(), True),
-            StructField("job_name", StringType(), True), StructField("status", StringType(), True),
-            StructField("submission_time", StringType(), True), StructField("completion_time", StringType(), True),
-            StructField("num_tasks", LongType(), True), StructField("num_completed_tasks", LongType(), True),
-            StructField("num_failed_tasks", LongType(), True), StructField("stage_ids", StringType(), True),
-            StructField("task_success_rate", DoubleType(), True)
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("job_id", LongType(), True), StructField("job_name", StringType(), True),
+            StructField("status", StringType(), True), StructField("submission_time", StringType(), True),
+            StructField("completion_time", StringType(), True), StructField("num_tasks", LongType(), True),
+            StructField("num_completed_tasks", LongType(), True), StructField("num_failed_tasks", LongType(), True),
+            StructField("stage_ids", StringType(), True), StructField("task_success_rate", DoubleType(), True)
         ])
         stages_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("stage_id", LongType(), True),
-            StructField("stage_name", StringType(), True), StructField("status", StringType(), True),
-            StructField("num_tasks", LongType(), True), StructField("executor_run_time", LongType(), True),
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("stage_id", LongType(), True), StructField("stage_name", StringType(), True),
+            StructField("status", StringType(), True), StructField("num_tasks", LongType(), True),
+            StructField("num_active_tasks", LongType(), True), StructField("num_complete_tasks", LongType(), True),
+            StructField("num_failed_tasks", LongType(), True), StructField("executor_run_time", LongType(), True),
+            StructField("executor_cpu_time", LongType(), True), StructField("submission_time", StringType(), True),
+            StructField("first_task_launched_time", StringType(), True), StructField("completion_time", StringType(), True),
             StructField("input_bytes", LongType(), True), StructField("output_bytes", LongType(), True),
             StructField("shuffle_read_bytes", LongType(), True), StructField("shuffle_write_bytes", LongType(), True),
-            StructField("memory_bytes_spilled", LongType(), True), StructField("disk_bytes_spilled", LongType(), True)
+            StructField("memory_bytes_spilled", LongType(), True), StructField("disk_bytes_spilled", LongType(), True),
+            StructField("task_completion_rate", DoubleType(), True), StructField("avg_executor_run_time_per_task", DoubleType(), True),
+            StructField("total_data_processed_mb", DoubleType(), True), StructField("shuffle_data_mb", DoubleType(), True)
         ])
         tasks_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("stage_id", LongType(), True),
-            StructField("stage_attempt_id", LongType(), True), StructField("task_id", LongType(), True),
-            StructField("index", LongType(), True), StructField("attempt", LongType(), True),
-            StructField("launch_time", StringType(), True), StructField("duration", LongType(), True),
-            StructField("executor_id", StringType(), True), StructField("host", StringType(), True),
-            StructField("status", StringType(), True), StructField("task_locality", StringType(), True),
-            StructField("speculative", BooleanType(), True)
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("stage_id", LongType(), True), StructField("stage_attempt_id", LongType(), True),
+            StructField("task_id", LongType(), True), StructField("index", LongType(), True),
+            StructField("attempt", LongType(), True), StructField("launch_time", StringType(), True),
+            StructField("duration", LongType(), True), StructField("executor_id", StringType(), True),
+            StructField("host", StringType(), True), StructField("status", StringType(), True),
+            StructField("task_locality", StringType(), True), StructField("speculative", BooleanType(), True)
         ])
         sql_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("sql_id", LongType(), True),
-            StructField("description", StringType(), True), StructField("status", StringType(), True),
-            StructField("duration_ms", LongType(), True), StructField("submission_time", StringType(), True),
-            StructField("sql_raw_json", StringType(), True)
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("sql_id", LongType(), True), StructField("description", StringType(), True),
+            StructField("status", StringType(), True), StructField("duration_ms", LongType(), True),
+            StructField("submission_time", StringType(), True), StructField("sql_raw_json", StringType(), True)
         ])
         executors_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("executor_id", StringType(), True),
-            StructField("host_port", StringType(), True), StructField("is_active", BooleanType(), True),
-            StructField("rdd_blocks", LongType(), True), StructField("memory_used", LongType(), True),
-            StructField("disk_used", LongType(), True), StructField("total_cores", LongType(), True),
-            StructField("max_tasks", LongType(), True), StructField("active_tasks", LongType(), True),
-            StructField("failed_tasks", LongType(), True), StructField("completed_tasks", LongType(), True),
-            StructField("total_tasks", LongType(), True), StructField("total_duration", LongType(), True),
-            StructField("total_gc_time", LongType(), True), StructField("total_input_bytes", LongType(), True),
-            StructField("total_shuffle_read", LongType(), True), StructField("total_shuffle_write", LongType(), True),
-            StructField("is_blacklisted", BooleanType(), True), StructField("max_memory", LongType(), True),
-            StructField("add_time", StringType(), True), StructField("executor_logs", StringType(), True)
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("executor_id", StringType(), True), StructField("host_port", StringType(), True),
+            StructField("is_active", BooleanType(), True), StructField("rdd_blocks", LongType(), True),
+            StructField("memory_used", LongType(), True), StructField("disk_used", LongType(), True),
+            StructField("total_cores", LongType(), True), StructField("max_tasks", LongType(), True),
+            StructField("active_tasks", LongType(), True), StructField("failed_tasks", LongType(), True),
+            StructField("completed_tasks", LongType(), True), StructField("total_tasks", LongType(), True),
+            StructField("total_duration", LongType(), True), StructField("total_gc_time", LongType(), True),
+            StructField("total_input_bytes", LongType(), True), StructField("total_shuffle_read", LongType(), True),
+            StructField("total_shuffle_write", LongType(), True), StructField("is_blacklisted", BooleanType(), True),
+            StructField("max_memory", LongType(), True), StructField("add_time", StringType(), True),
+            StructField("executor_logs", StringType(), True)
         ])
         task_summaries_schema = StructType([
             StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
-            StructField("application_id", StringType(), True), StructField("stage_id", LongType(), True),
-            StructField("stage_attempt_id", LongType(), True), StructField("raw_json", StringType(), True)
+            StructField("application_id", StringType(), True), StructField("attempt_id", StringType(), True),
+            StructField("stage_id", LongType(), True), StructField("stage_attempt_id", LongType(), True),
+            StructField("raw_json", StringType(), True)
         ])
-
+        
         # Create DataFrames
         apps_df = create_df(applications_analysis, applications_schema, "applications")
         jobs_df = create_df(jobs_analysis, jobs_schema, "jobs")
@@ -988,6 +1141,7 @@ class SparkMetricsAnalyzer:
         return apps_df, jobs_df, stages_df, tasks_df, sql_df, executors_df, task_summaries_df
 
 
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -995,186 +1149,362 @@ class SparkMetricsAnalyzer:
 
 # COMMAND ----------
 
-# DBTITLE 1,EMR Cluster Analysis
+# DBTITLE 1,Main Orchestration
 import concurrent.futures
-from typing import Dict, List, Any, Optional, Tuple
-import time
+import json
 import logging
+from typing import List, Dict, Any, Optional
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
 
-def process_single_application(app_id: str, shs_client: Any, analyzer: Any, cluster_id: str, cluster_name: str) -> Optional[Dict[str, Any]]:
-    """
-    Processes a single Spark application's data with comprehensive data extraction.
-    """
-    logger.info("🔍 Analyzing application: %s on cluster %s", app_id, cluster_name)
+# A private constant to limit the number of errors recorded per endpoint to avoid excessive memory usage.
+_MAX_ERRORS_PER_ENDPOINT = 3
 
-    app_results = {'applications': [], 'jobs': [], 'stages': [], 'tasks': [], 'sql_queries': [], 'executors': [], 'task_summaries': []}
+def _truncate_message(message: str, max_len: int = 500) -> str:
+    """Truncates a message to a maximum length."""
+    return message if len(message) <= max_len else message[:max_len-3] + "..."
 
-    # Circuit-breaker aware wrapper
+def _record_error(endpoint: str, fn: Any, exc: Exception, endpoint_errors: Dict[str, List]):
+    """Records a structured error for a failed endpoint call."""
+    now_iso = datetime.now().isoformat()
+    
+    # Determine a short code for the error type
+    if isinstance(exc, (requests.exceptions.ReadTimeout, requests.exceptions.Timeout)):
+        code = "TIMEOUT"
+    elif isinstance(exc, requests.exceptions.ConnectionError):
+        code = "CONNECTION_ERROR"
+    elif isinstance(exc, requests.exceptions.HTTPError):
+        code = f"HTTP_{exc.response.status_code}"
+    else:
+        code = "UNKNOWN_ERROR"
+
+    # Defensive: avoid masking original error recording if response properties fail
+    error_obj = {
+        'code': code,
+        'exception_type': type(exc).__name__,
+        'message': _truncate_message(str(exc)),
+        'api': getattr(fn, '__name__', 'unknown'),
+        'endpoint_key': endpoint,
+        'timestamp': now_iso
+    }
+
+    # Append with cap
+    lst = endpoint_errors.setdefault(endpoint, [])
+    if len(lst) < _MAX_ERRORS_PER_ENDPOINT:
+        lst.append(error_obj)
+
+def process_single_application(
+    app_id: str,
+    attempt_id: str,
+    shs_client: Any,
+    analyzer: Any,
+    cluster_id: str,
+    cluster_name: str,
+    endpoint_errors: Dict[str, List[Dict[str, Any]]],
+    endpoint_attempted: Dict[str, bool],
+    endpoint_skipped_reasons: Dict[str, List[str]], # Kept for consistent function signature
+    app_details: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """
+    Processes a single Spark application attempt by fetching its data concurrently.
+    This function uses a ThreadPoolExecutor to make parallel API calls for jobs, stages,
+    executors, and SQL queries to significantly speed up data retrieval.
+    """
+    logger.info(" -> Concurrently analyzing application %s, attempt %s", app_id, attempt_id)
+    app_results = {
+        'applications': [], 'jobs': [], 'stages': [], 'tasks': [],
+        'sql_queries': [], 'executors': [], 'task_summaries': []
+    }
+
+    def add_and_append(data_list: List[Dict], result_key: str):
+        if not isinstance(data_list, list):
+            logger.warning("⚠️ Data provided to add_and_append for key '%s' is not a list, skipping.", result_key)
+            return
+        for item in data_list:
+            item['application_id'] = app_id
+            item['attempt_id'] = attempt_id
+            item['cluster_id'] = cluster_id
+            item['cluster_name'] = cluster_name
+        app_results[result_key].extend(item for item in data_list if isinstance(item, dict))
+
     def safe_call(endpoint_key: str, fn, *args, **kwargs):
-        if hasattr(shs_client, "should_skip") and shs_client.should_skip(endpoint_key):
-            logger.warning("⏭️ Skipping endpoint '%s' due to prior failures", endpoint_key)
-            return None
+        endpoint_attempted[endpoint_key] = True
         try:
-            result = fn(*args, **kwargs)
-            if hasattr(shs_client, "record_success"):
-                shs_client.record_success(endpoint_key)
-            return result
+            return fn(*args, **kwargs)
         except Exception as e:
-            logger.error("❌ Endpoint '%s' call failed: %s", endpoint_key, str(e), exc_info=True)
-            if hasattr(shs_client, "record_failure"):
-                shs_client.record_failure(endpoint_key)
+            logger.error("❌ Final failure for endpoint '%s' (attempt %s) after all retries: %s", endpoint_key, attempt_id, str(e), exc_info=False)
+            _record_error(endpoint_key, fn, e, endpoint_errors)
             return None
 
+    # --- Stage 1: Analyze Application Performance (using pre-fetched details) ---
     try:
-        # App details
-        app_details = safe_call('applications', shs_client.get_application_details, app_id)
-        if not app_details:
-            logger.warning("⚠️ Application %s has no details/attempts. Skipping.", app_id)
-            return None
-
-        attempts = app_details.get('attempts', [])
-        if not attempts:
-            logger.warning("⚠️ Application %s has no attempts data. Skipping.", app_id)
-            return None
-
-        # Find the latest attempt by sorting by start time
-        latest_attempt = sorted(attempts, key=lambda x: x.get('startTime', ''))[-1]
-        latest_attempt_id = latest_attempt.get('attemptId')
-
-        # Analyze application performance
-        perf_analysis = analyzer.analyze_application_performance(app_details, latest_attempt_id)
-        perf_analysis['cluster_id'] = cluster_id
-        perf_analysis['cluster_name'] = cluster_name
-        app_results['applications'].append(perf_analysis)
-
-        # Helper to add context and append results
-        def add_and_append(data_list: List[Dict], result_key: str):
-            for item in data_list:
-                item['application_id'] = app_id
-                item['cluster_id'] = cluster_id
-                item['cluster_name'] = cluster_name
-                app_results[result_key].append(item)
-
-        # Fetch and analyze jobs
-        jobs = safe_call('jobs', shs_client.get_application_jobs, app_id, latest_attempt_id)
-        if jobs:
-            add_and_append(analyzer.analyze_job_performance(jobs), 'jobs')
-
-        # Fetch and analyze stages, tasks, and task summaries
-        stages = safe_call('stages', shs_client.get_application_stages, app_id, latest_attempt_id)
-        if stages:
-            add_and_append(analyzer.analyze_stage_performance(stages), 'stages')
-
-            for stage in stages:
-                stage_id = stage.get('stageId')
-                stage_attempt_id = stage.get('attemptId', 0)
-
-                tasks = safe_call('tasks', shs_client.get_stage_tasks, app_id, latest_attempt_id, stage_id, stage_attempt_id)
-                if tasks:
-                    for task in tasks:
-                        task['stage_id'] = stage_id
-                        task['stage_attempt_id'] = stage_attempt_id
-                    add_and_append(analyzer.analyze_task_performance(tasks), 'tasks')
-
-                task_summary = safe_call('task_summaries', shs_client.get_stage_task_summary, app_id, latest_attempt_id, stage_id, stage_attempt_id)
-                if task_summary:
-                    task_summary['stage_id'] = stage_id
-                    task_summary['stage_attempt_id'] = stage_attempt_id
-                    add_and_append(analyzer.analyze_task_summaries([task_summary]), 'task_summaries')
-
-        # Fetch and analyze SQL queries
-        sql_queries = safe_call('sql', shs_client.get_application_sql_queries, app_id, latest_attempt_id)
-        if sql_queries:
-            add_and_append(analyzer.analyze_sql_queries(sql_queries), 'sql_queries')
-
-        # Fetch and analyze executors
-        executors = safe_call('executors', shs_client.get_application_executors, app_id, latest_attempt_id)
-        if executors:
-            add_and_append(analyzer.analyze_executor_performance(executors), 'executors')
-
-        return app_results
-
+        perf_analysis = analyzer.analyze_application_performance(app_details, attempt_id)
+        add_and_append([perf_analysis], 'applications')
     except Exception as e:
-        logger.error("❌ Failed to analyze application %s: %s", app_id, str(e), exc_info=True)
-        return None
+        logger.error("❌ Failed during 'applications' post-processing for attempt %s: %s", attempt_id, str(e), exc_info=True)
+        _record_error('applications', analyzer.analyze_application_performance, e, endpoint_errors)
 
+    # --- Stage 2: Concurrently Fetch Primary Data Endpoints ---
+    fetched_data = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="SHS_Primary") as executor:
+        future_to_endpoint = {
+            executor.submit(safe_call, 'jobs', shs_client.get_application_jobs, app_id, attempt_id): 'jobs',
+            executor.submit(safe_call, 'stages', shs_client.get_application_stages, app_id, attempt_id): 'stages',
+            executor.submit(safe_call, 'executors', shs_client.get_application_executors, app_id, attempt_id): 'executors',
+            executor.submit(safe_call, 'sql', shs_client.get_application_sql_queries, app_id, attempt_id): 'sql'
+        }
+        for future in concurrent.futures.as_completed(future_to_endpoint):
+            endpoint_key = future_to_endpoint[future]
+            try:
+                result = future.result()
+                if result:
+                    fetched_data[endpoint_key] = result
+            except Exception as e:
+                logger.error("❌ Exception retrieving result for endpoint '%s': %s", endpoint_key, str(e), exc_info=True)
+
+    # --- Stage 3: Process Concurrently Fetched Data ---
+    if 'jobs' in fetched_data:
+        try:
+            job_analysis = analyzer.analyze_job_performance(fetched_data['jobs'])
+            add_and_append(job_analysis, 'jobs')
+        except Exception as e:
+            logger.error("❌ Failed during 'jobs' processing for attempt %s: %s", attempt_id, str(e), exc_info=True)
+            _record_error('jobs', analyzer.analyze_job_performance, e, endpoint_errors)
+
+    if 'executors' in fetched_data:
+        try:
+            executor_analysis = analyzer.analyze_executor_performance(fetched_data['executors'])
+            add_and_append(executor_analysis, 'executors')
+        except Exception as e:
+            logger.error("❌ Failed during 'executors' processing for attempt %s: %s", attempt_id, str(e), exc_info=True)
+            _record_error('executors', analyzer.analyze_executor_performance, e, endpoint_errors)
+
+    if 'sql' in fetched_data:
+        try:
+            sql_analysis = analyzer.analyze_sql_queries(fetched_data['sql'])
+            add_and_append(sql_analysis, 'sql_queries')
+        except Exception as e:
+            logger.error("❌ Failed during 'sql' processing for attempt %s: %s", attempt_id, str(e), exc_info=True)
+            _record_error('sql', analyzer.analyze_sql_queries, e, endpoint_errors)
+
+    # --- Stage 4: Process Stages and Concurrently Fetch Sub-tasks ---
+    if 'stages' in fetched_data:
+        stages_data = fetched_data['stages']
+        try:
+            stages_analysis = analyzer.analyze_stage_performance(stages_data)
+            add_and_append(stages_analysis, 'stages')
+        except Exception as e:
+            logger.error("❌ Failed during 'stages' post-processing for attempt %s: %s", attempt_id, str(e), exc_info=True)
+            _record_error('stages', analyzer.analyze_stage_performance, e, endpoint_errors)
+
+        # Concurrently fetch tasks and summaries for all stages
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="SHS_SubTask") as executor:
+            future_to_stage_task = {}
+            for stage_raw in stages_data:
+                stage_id = stage_raw.get('stageId')
+                stage_attempt_id = stage_raw.get('attemptId', 0)
+                if stage_id is None:
+                    continue
+                # Submit tasks and task_summaries calls for each stage
+                future_to_stage_task[executor.submit(safe_call, 'tasks', shs_client.get_stage_tasks, app_id, attempt_id, stage_id, stage_attempt_id)] = ('tasks', stage_id, stage_attempt_id)
+                future_to_stage_task[executor.submit(safe_call, 'task_summaries', shs_client.get_stage_task_summary, app_id, attempt_id, stage_id, stage_attempt_id)] = ('task_summaries', stage_id, stage_attempt_id)
+            
+            for future in concurrent.futures.as_completed(future_to_stage_task):
+                endpoint_key, stage_id, stage_attempt_id = future_to_stage_task[future]
+                try:
+                    result = future.result()
+                    if not result:
+                        continue
+                    
+                    if endpoint_key == 'tasks':
+                        for task in result:
+                            task['stage_id'] = stage_id
+                            task['stage_attempt_id'] = stage_attempt_id
+                        task_analysis = analyzer.analyze_task_performance(result)
+                        add_and_append(task_analysis, 'tasks')
+                    elif endpoint_key == 'task_summaries':
+                        result['stage_id'] = stage_id
+                        result['stage_attempt_id'] = stage_attempt_id
+                        summary_analysis = analyzer.analyze_task_summaries([result])
+                        add_and_append(summary_analysis, 'task_summaries')
+
+                except Exception as e:
+                    logger.error("❌ Exception retrieving sub-task result for endpoint '%s' stage '%s': %s", endpoint_key, stage_id, str(e), exc_info=True)
+    else:
+        logger.warning("⚠️ No stage data returned from API for attempt %s. Skipping task and summary collection.", attempt_id)
+    
+    return app_results
+
+def analyze_application_attempts(
+    app_id: str,
+    shs_client: Any,
+    analyzer: Any,
+    cluster_id: str,
+    cluster_name: str,
+    endpoint_errors: Dict[str, List[Dict[str, Any]]],
+    endpoint_attempted: Dict[str, bool],
+    endpoint_skipped_reasons: Dict[str, List[str]]
+) -> List[Dict[str, Any]]:
+    """
+    Orchestrates the analysis of a single application by finding all successful attempts
+    and processing each one individually.
+    """
+    all_attempt_results = []
+    
+    # This is a safecall wrapper for use inside this orchestrator function
+    def orchestrator_safe_call(endpoint_key: str, fn, *args, **kwargs):
+        endpoint_attempted[endpoint_key] = True
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            logger.error("API call for endpoint '%s' app '%s' failed: %s", endpoint_key, app_id, str(e), exc_info=True)
+            _record_error(endpoint_key, fn, e, endpoint_errors)
+            return None
+
+    app_details = orchestrator_safe_call('applications', shs_client.get_application_details, app_id)
+
+    if not app_details or not app_details.get('attempts'):
+        logger.warning("Application %s has no details or attempts data. Skipping.", app_id)
+        return []
+
+    attempts = app_details.get('attempts', [])
+    successful_attempts = [attempt for attempt in attempts if attempt.get('completed', False)]
+    
+    logger.info("Found %d total attempts for app %s. Will analyze %d successful attempts.", len(attempts), app_id, len(successful_attempts))
+    if not successful_attempts:
+        return []
+
+    for attempt in successful_attempts:
+        attempt_id = attempt.get('attemptId')
+        if not attempt_id:
+            continue
+        
+        attempt_result = process_single_application(
+            app_id=app_id,
+            attempt_id=attempt_id,
+            shs_client=shs_client,
+            analyzer=analyzer,
+            cluster_id=cluster_id,
+            cluster_name=cluster_name,
+            endpoint_errors=endpoint_errors,
+            endpoint_attempted=endpoint_attempted,
+            endpoint_skipped_reasons=endpoint_skipped_reasons,
+            app_details=app_details
+        )
+        if attempt_result:
+            all_attempt_results.append(attempt_result)
+            
+    return all_attempt_results
 
 def analyze_single_cluster(
     cluster_info: Dict,
     timeout_seconds: int,
     max_applications: int,
-    spark_session: 'SparkSession',
+    spark_session: SparkSession,
     persistent_ui_timeout: int
 ) -> Dict[str, Any]:
-    """
-    Analyzes a single EMR cluster, fetching and processing its Spark application data.
-    """
+    """Analyzes a single EMR cluster. This version now uses an orchestrator to analyze all successful attempts for each application."""
     cluster_id = cluster_info['cluster_id']
     cluster_name = cluster_info['cluster_name']
     cluster_arn = cluster_info['cluster_arn']
-    logger.info("🕵️ Starting analysis for cluster: %s (%s)", cluster_name, cluster_id)
+    logger.info("Starting analysis for cluster: %s (%s)", cluster_name, cluster_id)
 
     results_aggregator = {
         'cluster_id': cluster_id, 'cluster_name': cluster_name, 'status': cluster_info.get('status', 'UNKNOWN'),
+        'normalized_instance_hours': cluster_info.get('normalized_instance_hours', 0),
         'applications': [], 'jobs': [], 'stages': [], 'tasks': [], 'sql_queries': [], 'executors': [], 'task_summaries': [],
-        'analysis_status': 'PENDING', 'error_message': ""
+        'analysis_status': 'PENDING', 'error_message': ''
     }
+    
+    tracked_endpoints = ['applications', 'jobs', 'stages', 'tasks', 'sql', 'executors', 'task_summaries']
+    endpoint_errors: Dict[str, List[Dict[str, Any]]] = {k: [] for k in tracked_endpoints}
+    endpoint_attempted: Dict[str, bool] = {k: False for k in tracked_endpoints}
+    endpoint_skipped_reasons: Dict[str, List[str]] = {k: [] for k in tracked_endpoints}
+    
+    # This is a safecall wrapper for use inside this orchestrator function
+    def cluster_safe_call(endpoint_key: str, fn, *args, **kwargs):
+        try:
+            # Circuit breaker logic (if implemented in client)
+            if hasattr(shs_client, 'should_skip') and shs_client.should_skip(endpoint_key):
+                logger.warning("Skipping endpoint %s due to prior failures", endpoint_key)
+                endpoint_skipped_reasons.setdefault(endpoint_key, []).append("Skipped due to prior failures (circuit breaker)")
+                return None
+        except UnboundLocalError:
+            pass  # shs_client not yet defined
+            
+        endpoint_attempted[endpoint_key] = True
+        try:
+            result = fn(*args, **kwargs)
+            try:
+                if hasattr(shs_client, 'record_success'):
+                    shs_client.record_success(endpoint_key)
+            except Exception: pass
+            return result
+        except Exception as e:
+            logger.error("Endpoint '%s' call failed: %s", endpoint_key, str(e), exc_info=True)
+            _record_error(endpoint_key, fn, e, endpoint_errors)
+            try:
+                if hasattr(shs_client, 'record_failure'):
+                    shs_client.record_failure(endpoint_key)
+            except Exception: pass
+            return None
 
     try:
         server_config = ServerConfig(emr_cluster_arn=cluster_arn, timeout=timeout_seconds)
         emr_client = EMRPersistentUIClient(server_config)
         base_url, session = emr_client.initialize(max_wait_time=persistent_ui_timeout)
-
+        
         shs_client = SparkHistoryServerClient(base_url, session)
-        if hasattr(shs_client, "_max_endpoint_failures"):
-            shs_client._max_endpoint_failures = MAX_ENDPOINT_FAILURES
-
+        
         analyzer = SparkMetricsAnalyzer(spark_session)
+        
+        applications = cluster_safe_call('applications', shs_client.get_applications, limit=max_applications)
 
-        applications = shs_client.get_applications(limit=max_applications)
         if not applications:
-            logger.warning("⚠️ No applications found in Spark History Server for %s", cluster_name)
+            logger.warning("No applications found in Spark History Server for %s", cluster_name)
             results_aggregator['analysis_status'] = 'NO_APPLICATIONS'
+            results_aggregator['endpoint_errors'] = endpoint_errors
+            results_aggregator['endpoint_attempted'] = endpoint_attempted
+            results_aggregator['endpoint_skipped_reasons'] = endpoint_skipped_reasons
             return results_aggregator
 
-        logger.info("✅ Found %s applications to analyze in %s", len(applications), cluster_name)
-
+        logger.info("Found %s applications to analyze in %s", len(applications), cluster_name)
         for app in applications:
             app_id = app.get('id')
             if not app_id:
                 continue
-            app_data = process_single_application(app_id, shs_client, analyzer, cluster_id, cluster_name)
-            if app_data:
-                for key in app_data:
-                    results_aggregator[key].extend(app_data[key])
+            
+            attempt_results_list = analyze_application_attempts(
+                app_id, shs_client, analyzer, cluster_id, cluster_name,
+                endpoint_errors, endpoint_attempted, endpoint_skipped_reasons
+            )
+            
+            for app_data in attempt_results_list:
+                if app_data:
+                    for key in ['applications', 'jobs', 'stages', 'tasks', 'sql_queries', 'executors', 'task_summaries']:
+                        results_aggregator[key].extend(app_data.get(key, []))
 
-        # If no data landed across all endpoints, mark as FAILED with a clear message; else COMPLETED
-        if not any([
-            results_aggregator['applications'],
-            results_aggregator['jobs'],
-            results_aggregator['stages'],
-            results_aggregator['tasks'],
-            results_aggregator['sql_queries'],
-            results_aggregator['executors'],
-            results_aggregator['task_summaries']
-        ]):
+        # Finalize status
+        if not any(results_aggregator.get(key) for key in ['applications', 'jobs', 'stages', 'tasks', 'sql_queries', 'executors', 'task_summaries']):
             results_aggregator['analysis_status'] = 'FAILED'
             if not results_aggregator['error_message']:
-                results_aggregator['error_message'] = 'No data returned from SHS endpoints'
-            logger.warning("⚠️ Cluster %s analysis produced no data across all endpoints.", cluster_name)
+                results_aggregator['error_message'] = "No data returned from SHS endpoints for any successful attempts"
+            logger.warning("Cluster %s analysis produced no data across all endpoints.", cluster_name)
         else:
             results_aggregator['analysis_status'] = 'COMPLETED'
-            logger.info("✅ Completed analysis for cluster: %s", cluster_name)
-
+        
+        logger.info("Completed analysis for cluster: %s", cluster_name)
     except Exception as e:
-        logger.error("❌ Failed to analyze cluster %s: %s", cluster_name, str(e), exc_info=True)
+        logger.error("Failed to analyze cluster %s: %s", cluster_name, str(e), exc_info=True)
         results_aggregator['analysis_status'] = 'FAILED'
         results_aggregator['error_message'] = str(e)
 
+    results_aggregator['endpoint_errors'] = endpoint_errors
+    results_aggregator['endpoint_attempted'] = endpoint_attempted
+    results_aggregator['endpoint_skipped_reasons'] = endpoint_skipped_reasons
     return results_aggregator
-
 
 def process_clusters_in_batches(
     clusters_to_analyze: List[Dict],
@@ -1182,44 +1512,45 @@ def process_clusters_in_batches(
     batch_delay_seconds: int,
     spark_session: Any
 ) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict]]:
-    """
-    Process clusters in sequential batches to manage resources and API limits.
-    """
+    """Process clusters in sequential batches to manage resources and API limits. This version builds a JSON-as-string status_details per cluster with endpoint-level OK/FAILED/SKIPPED."""
     all_results = {'applications': [], 'jobs': [], 'stages': [], 'tasks': [], 'sql_queries': [], 'executors': [], 'task_summaries': []}
     cluster_summaries = []
 
-    def _endpoint_status_summary(c: Dict[str, Any]) -> str:
-        """
-        Build a compact endpoints success/failure summary, or return error if present.
-        """
-        if c.get('error_message'):
-            return c['error_message']
-        parts = []
-        parts.append(f"applications: {'OK' if len(c.get('applications', [])) > 0 else 'FAILED'}")
-        parts.append(f"jobs: {'OK' if len(c.get('jobs', [])) > 0 else 'FAILED'}")
-        parts.append(f"stages: {'OK' if len(c.get('stages', [])) > 0 else 'FAILED'}")
-        parts.append(f"tasks: {'OK' if len(c.get('tasks', [])) > 0 else 'FAILED'}")
-        parts.append(f"sql: {'OK' if len(c.get('sql_queries', [])) > 0 else 'FAILED'}")
-        parts.append(f"executors: {'OK' if len(c.get('executors', [])) > 0 else 'FAILED'}")
-        parts.append(f"task_summaries: {'OK' if len(c.get('task_summaries', [])) > 0 else 'FAILED'}")
-        return "; ".join(parts)
+    def endpoint_status_summary(c: Dict[str, Any]) -> str:
+        key_map = {'applications': 'applications', 'jobs': 'jobs', 'stages': 'stages', 'tasks': 'tasks', 'sql': 'sql_queries', 'executors': 'executors', 'task_summaries': 'task_summaries'}
+        attempted = c.get('endpoint_attempted', {})
+        errors = c.get('endpoint_errors', {})
+        skipped = c.get('endpoint_skipped_reasons', {})
+        status_obj = {}
+        for ep, data_key in key_map.items():
+            has_data = len(c.get(data_key, [])) > 0
+            ep_attempted = bool(attempted.get(ep, False))
+            ep_errors = errors.get(ep, [])
+            ep_skips = skipped.get(ep, [])
+            if has_data:
+                status_obj[ep] = 'OK'
+            elif ep_attempted and len(ep_errors) > 0:
+                # Extract just the error codes from the error objects
+                error_codes = [err.get('code', 'UNKNOWN') for err in ep_errors[:MAX_ENDPOINT_FAILURES]]
+                status_obj[ep] = f"FAILED({','.join(error_codes)})"
+            else:
+                # Use a simplified reason
+                reason = ep_skips[0] if ep_skips else "No data"
+                # Truncate long reasons to keep it concise
+                if len(reason) > 30:
+                    reason = reason[:27] + "..."
+                status_obj[ep] = f"SKIPPED({reason})"
+        return json.dumps(status_obj, separators=(',', ':'))
 
     total_batches = (len(clusters_to_analyze) + batch_size - 1) // batch_size
-
     for i in range(0, len(clusters_to_analyze), batch_size):
         batch_clusters = clusters_to_analyze[i:i + batch_size]
         current_batch_num = (i // batch_size) + 1
-        logger.info("🔄 Processing batch %d/%d...", current_batch_num, total_batches)
+        logger.info("Processing batch %d/%d...", current_batch_num, total_batches)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch_clusters)) as executor:
-            future_to_cluster = {
-                executor.submit(
-                    analyze_single_cluster,
-                    c_info, TIMEOUT_SECONDS, MAX_APPLICATIONS, spark_session, PERSISTENT_UI_TIMEOUT_SECONDS
-                ): c_info
-                for c_info in batch_clusters
-            }
-
+            future_to_cluster = {executor.submit(analyze_single_cluster, c_info, TIMEOUT_SECONDS, MAX_APPLICATIONS, spark_session, PERSISTENT_UI_TIMEOUT_SECONDS): c_info for c_info in batch_clusters}
+            
             for future in concurrent.futures.as_completed(future_to_cluster):
                 cluster_info = future_to_cluster[future]
                 try:
@@ -1227,35 +1558,40 @@ def process_clusters_in_batches(
                     if cluster_results:
                         for key in all_results.keys():
                             all_results[key].extend(cluster_results.get(key, []))
-
+                        
                         cluster_summaries.append({
                             'cluster_id': cluster_results['cluster_id'],
                             'cluster_name': cluster_results['cluster_name'],
                             'status': cluster_results['status'],
                             'analysis_status': cluster_results['analysis_status'],
-                            'status_details': _endpoint_status_summary(cluster_results),
+                            'status_details': endpoint_status_summary(cluster_results),
+                            'normalized_instance_hours': cluster_results.get('normalized_instance_hours', 0),
                             'total_applications': len(cluster_results['applications']),
                             'total_jobs': len(cluster_results['jobs']),
                             'total_stages': len(cluster_results['stages']),
                             'total_tasks': len(cluster_results['tasks']),
                             'total_sql_queries': len(cluster_results['sql_queries']),
                             'total_executors': len(cluster_results['executors']),
-                            'total_task_summaries': len(cluster_results['task_summaries'])
+                            'total_task_summaries': len(cluster_results['task_summaries']),
                         })
                 except Exception as e:
-                    logger.error("❌ Error processing results for cluster %s: %s", cluster_info['cluster_id'], str(e), exc_info=True)
+                    logger.error("Error processing results for cluster %s: %s", cluster_info['cluster_id'], str(e), exc_info=True)
                     cluster_summaries.append({
-                        'cluster_id': cluster_info['cluster_id'], 'cluster_name': cluster_info['cluster_name'], 'status': 'FAILED_PROCESSING',
-                        'analysis_status': 'FAILED', 'status_details': str(e), 'total_applications': 0, 'total_jobs': 0,
-                        'total_stages': 0, 'total_tasks': 0, 'total_sql_queries': 0, 'total_executors': 0, 'total_task_summaries': 0
+                        'cluster_id': cluster_info['cluster_id'],
+                        'cluster_name': cluster_info['cluster_name'],
+                        'status': 'FAILED_PROCESSING',
+                        'analysis_status': 'FAILED',
+                        'status_details': json.dumps({'error': _truncate_message(str(e))}),
+                        'normalized_instance_hours': cluster_info.get('normalized_instance_hours', 0),
+                        'total_applications': 0, 'total_jobs': 0, 'total_stages': 0,
+                        'total_tasks': 0, 'total_sql_queries': 0, 'total_executors': 0, 'total_task_summaries': 0
                     })
 
         if current_batch_num < total_batches:
-            logger.info("⏳ Waiting %d seconds between batches...", batch_delay_seconds)
+            logger.info("Waiting %d seconds between batches...", batch_delay_seconds)
             time.sleep(batch_delay_seconds)
-
-    return (all_results['applications'], all_results['jobs'], all_results['stages'], all_results['tasks'],
-            all_results['sql_queries'], all_results['executors'], all_results['task_summaries'], cluster_summaries)
+            
+    return all_results['applications'], all_results['jobs'], all_results['stages'], all_results['tasks'], all_results['sql_queries'], all_results['executors'], all_results['task_summaries'], cluster_summaries
 
 
 # COMMAND ----------
@@ -1274,24 +1610,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def main_analysis() -> Dict[str, Any]:
-    """
-    Main function to execute the complete Spark History Server analysis.
-    """
+def main_analysis():
+    """Main function to drive the EMR cluster analysis."""
     try:
-        logger.info("🚀 Starting EMR Spark History Server Analysis")
-        spark = SparkSession.builder.appName("EMR-Spark-History-Analysis").getOrCreate()
-
-        discovery = EMRClusterDiscovery(AWS_REGION)
-        clusters_to_analyze = []
-
+        # Step 1: Discover Clusters
+        emr_discovery = EMRClusterDiscovery(region=AWS_REGION)
+        total_clusters_discovered = 0
+        
         if EMR_CLUSTER_ARN:
-            logger.info("🎯 Single cluster mode - using provided EMR Cluster ARN.")
-            cluster_details = discovery.get_cluster_details(EMR_CLUSTER_ARN.split('/')[-1])
-            clusters_to_analyze.append({**cluster_details, 'cluster_arn': EMR_CLUSTER_ARN})
+            logger.info("Analyzing single specified EMR cluster: %s", EMR_CLUSTER_ARN)
+            cluster_details = emr_discovery.get_cluster_details(EMR_CLUSTER_ARN.split('/')[-1])
+            clusters_to_analyze = [cluster_details] if cluster_details else []
+            total_clusters_discovered = 1 if cluster_details else 0
         else:
-            logger.info("🌐 Multi-cluster discovery mode.")
-            discovered_clusters = discovery.discover_clusters(
+            logger.info("Discovering EMR clusters based on specified criteria...")
+            discovered_clusters = emr_discovery.discover_clusters(
                 states=CLUSTER_STATES_LIST,
                 name_filter=CLUSTER_NAME_FILTER,
                 max_clusters=MAX_CLUSTERS,
@@ -1299,25 +1632,35 @@ def main_analysis() -> Dict[str, Any]:
                 created_before=PARSED_CREATED_BEFORE_DATE,
                 custom_hours_threshold=CUSTOM_HOURS_THRESHOLD
             )
-            for cluster_summary in discovered_clusters:
-                try:
-                    cluster_details = discovery.get_cluster_details(cluster_summary['cluster_id'])
-                    if discovery.validate_cluster_for_analysis(cluster_details):
-                        clusters_to_analyze.append({**cluster_summary, **cluster_details})
-                except Exception as e:
-                    logger.error("❌ Failed to validate cluster %s: %s", cluster_summary['cluster_id'], str(e), exc_info=True)
+            total_clusters_discovered = len(discovered_clusters)
+            
+            # Step 2: Validate and Get Details for Discovered Clusters
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_cluster = {executor.submit(emr_discovery.get_cluster_details, c['cluster_id']): c for c in discovered_clusters}
+                detailed_clusters = [future.result() for future in concurrent.futures.as_completed(future_to_cluster)]
+            
+            clusters_to_analyze = [c for c in detailed_clusters if emr_discovery.validate_cluster_for_analysis(c)]
 
         if not clusters_to_analyze:
-            logger.warning("⚠️ No valid clusters found for analysis.")
-            return {'summary': {'total_clusters_analyzed': 0}}
+            logger.warning("No valid clusters found for analysis.")
+            return {
+                'summary': {
+                    'total_clusters_discovered': total_clusters_discovered,
+                    'total_clusters_analyzed': 0,
+                    'clusters_fully_analyzed': 0,
+                    'cluster_analysis_success_rate': 0.0
+                }
+            }
+        
+        logger.info("Will analyze %s clusters.", len(clusters_to_analyze))
 
-        logger.info("📊 Will analyze %s cluster(s).", len(clusters_to_analyze))
-
+        # Step 3: Process clusters in batches
         all_apps, all_jobs, all_stages, all_tasks, all_sql, all_execs, all_task_sums, summaries = process_clusters_in_batches(
             clusters_to_analyze, BATCH_SIZE, BATCH_DELAY_SECONDS, spark
         )
 
-        logger.info("📊 Creating analysis DataFrames...")
+        # Step 4: Create DataFrames
+        logger.info("Creating analysis DataFrames...")
         analyzer = SparkMetricsAnalyzer(spark)
         apps_df, jobs_df, stages_df, tasks_df, sql_df, exec_df, task_sum_df = analyzer.create_dynamic_dataframes(
             all_apps, all_jobs, all_stages, all_tasks, all_sql, all_execs, all_task_sums
@@ -1326,36 +1669,76 @@ def main_analysis() -> Dict[str, Any]:
         cluster_summary_df = None
         if summaries:
             summary_schema = StructType([
-                StructField('cluster_id', StringType(), True), StructField('cluster_name', StringType(), True),
-                StructField('status', StringType(), True), StructField('analysis_status', StringType(), True),
-                StructField('status_details', StringType(), True), StructField('total_applications', IntegerType(), True),
-                StructField('total_jobs', IntegerType(), True), StructField('total_stages', IntegerType(), True),
-                StructField('total_tasks', IntegerType(), True), StructField('total_sql_queries', IntegerType(), True),
-                StructField('total_executors', IntegerType(), True), StructField('total_task_summaries', IntegerType(), True)
+                StructField("cluster_id", StringType(), True), StructField("cluster_name", StringType(), True),
+                StructField("status", StringType(), True), StructField("analysis_status", StringType(), True),
+                StructField("status_details", StringType(), True),
+                StructField("normalized_instance_hours", IntegerType(), True),
+                StructField("total_applications", IntegerType(), True), StructField("total_jobs", IntegerType(), True),
+                StructField("total_stages", IntegerType(), True), StructField("total_tasks", IntegerType(), True),
+                StructField("total_sql_queries", IntegerType(), True), StructField("total_executors", IntegerType(), True),
+                StructField("total_task_summaries", IntegerType(), True)
             ])
             cluster_summary_df = spark.createDataFrame(summaries, schema=summary_schema)
 
+        # Step 5: Final Summary
+        total_clusters_analyzed = len([c for c in (summaries or []) if c.get('analysis_status') == 'COMPLETED'])
+        
+        # Calculate clusters_fully_analyzed - clusters with data from all major endpoints
+        clusters_fully_analyzed = 0
+        if summaries:
+            for cluster_summary in summaries:
+                # A cluster is considered fully analyzed if it has data from all major endpoints
+                has_all_data = (
+                    cluster_summary.get('total_applications', 0) > 0 and
+                    cluster_summary.get('total_jobs', 0) > 0 and
+                    cluster_summary.get('total_stages', 0) > 0 and
+                    cluster_summary.get('total_tasks', 0) > 0 and
+                    cluster_summary.get('total_sql_queries', 0) > 0 and
+                    cluster_summary.get('total_executors', 0) > 0 and
+                    cluster_summary.get('total_task_summaries', 0) > 0
+                )
+                if has_all_data:
+                    clusters_fully_analyzed += 1
+        
+        # Calculate success rate
+        cluster_analysis_success_rate = 0.0
+        if total_clusters_analyzed > 0:
+            cluster_analysis_success_rate = round((clusters_fully_analyzed / total_clusters_analyzed) * 100.0, 2)
+        
         final_summary = {
-            'total_clusters_analyzed': len([c for c in (summaries or []) if c['analysis_status'] == 'COMPLETED']),
-            'total_applications': len(all_apps), 'total_jobs': len(all_jobs), 'total_stages': len(all_stages),
-            'total_tasks': len(all_tasks), 'total_sql_queries': len(all_sql), 'total_executors': len(all_execs),
+            'clusters_discovered_count': total_clusters_discovered,
+            'clusters_extracted_count': total_clusters_analyzed,
+            'clusters_fully_analyzed_count': clusters_fully_analyzed,
+            'cluster_analysis_success_rate %': cluster_analysis_success_rate,
+            'total_applications': len(all_apps),
+            'total_jobs': len(all_jobs),
+            'total_stages': len(all_stages),
+            'total_tasks': len(all_tasks),
+            'total_sql_queries': len(all_sql),
+            'total_executors': len(all_execs),
             'total_task_summaries': len(all_task_sums)
         }
 
         return {
-            'cluster_summaries_df': cluster_summary_df, 'applications_df': apps_df, 'jobs_df': jobs_df,
-            'stages_df': stages_df, 'tasks_df': tasks_df, 'sql_df': sql_df, 'executors_df': exec_df,
-            'task_summaries_df': task_sum_df, 'summary': final_summary
+            "cluster_summaries_df": cluster_summary_df,
+            "applications_df": apps_df,
+            "jobs_df": jobs_df,
+            "stages_df": stages_df,
+            "tasks_df": tasks_df,
+            "sql_df": sql_df,
+            "executors_df": exec_df,
+            "task_summaries_df": task_sum_df,
+            "summary": final_summary
         }
-
     except Exception as e:
-        logger.error("❌ Main analysis failed: %s", str(e), exc_info=True)
+        logger.error("Main analysis failed: %s", str(e), exc_info=True)
         raise
 
 # Execute main analysis
-try:
-    results = main_analysis()
+results = main_analysis()
 
+# Display summary and make DataFrames available
+if results:
     cluster_summaries_df = results.get('cluster_summaries_df')
     applications_df = results.get('applications_df')
     jobs_df = results.get('jobs_df')
@@ -1365,23 +1748,24 @@ try:
     executors_df = results.get('executors_df')
     task_summaries_df = results.get('task_summaries_df')
     analysis_summary = results.get('summary', {})
-
-    print("\n" + "="*100 + "\n✨ EMR SPARK HISTORY ANALYSIS COMPLETED! ✨\n" + "="*100)
+    
+    print("-" * 100)
+    print("EMR SPARK HISTORY ANALYSIS COMPLETED!")
+    print("-" * 100)
     for key, value in analysis_summary.items():
-        print(f"✅ {key.replace('_', ' ').title()}: {value}")
-
-    print("\n📊 DataFrames available for analysis:\n • cluster_summaries_df\n • applications_df\n • jobs_df\n • stages_df\n • tasks_df\n • sql_df\n • executors_df\n • task_summaries_df")
+        print(f"  {key.replace('_', ' ').title()}: {value}")
+    print("\nDataFrames available for analysis: cluster_summaries_df, applications_df, jobs_df, stages_df, tasks_df, sql_df, executors_df, task_summaries_df")
 
     # Write outputs with date-based versioning in prod
     if ENVIRONMENT == "prod" and OUTPUT_RUN_PATH:
-        logger.info("📤 Writing analysis results to S3: %s", OUTPUT_RUN_PATH)
-        for df_name, df_instance in results.items():
-            if df_name.endswith('_df') and df_instance:
-                df_instance.write.mode("overwrite").parquet(f"{OUTPUT_RUN_PATH}/{df_name.replace('_df', '')}/")
-        logger.info("✅ All analysis results successfully written to S3.")
-except Exception as e:
-    print(f"\n❌ ANALYSIS FAILED: {str(e)}\nPlease check the logs above for detailed error information.")
-
+        logger.info("Writing analysis results to S3: %s", OUTPUT_RUN_PATH)
+        try:
+            for df_name, df_instance in results.items():
+                if df_name.endswith('_df') and df_instance:
+                    df_instance.write.mode('overwrite').parquet(f"{OUTPUT_RUN_PATH}/{df_name.replace('_df', '')}")
+            logger.info("All analysis results successfully written to S3.")
+        except Exception as e:
+            print(f"\n❌ ANALYSIS FAILED: {str(e)} - check the logs above for detailed error information.")
 
 # COMMAND ----------
 
@@ -1460,3 +1844,56 @@ if 'sql_df' in locals() and sql_df:
     display(sql_df)
 else:
     print("SQL queries DataFrame is not available.")
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StructType, StructField, IntegerType, StringType
+# Step 1: Parse JSON and explode the nodes array (equivalent to lateral view explode)
+raw_df = sql_df.withColumn("parsed_json", F.from_json(F.col("sql_raw_json"), 
+                       StructType([
+                           StructField("nodes", ArrayType(
+                               StructType([
+                                   StructField("nodeId", IntegerType(), True),
+                                   StructField("nodeName", StringType(), True),
+                                   StructField("metrics", ArrayType(
+                                       StructType([
+                                           StructField("name", StringType(), True),
+                                           StructField("value", StringType(), True)
+                                       ])
+                                   ), True)
+                               ])
+                           ), True)
+                       ]))) \
+         .select("*", F.explode(F.col("parsed_json.nodes")).alias("nodemetrics"))
+
+# Step 2: Create photon check with case when logic
+photoncheck_df = raw_df.withColumn("photonbinary", 
+    F.when(F.col("nodemetrics.nodeName") == "MapElements", 0)
+     .when(F.col("nodemetrics.nodeName") == "MapPartitions", 0)
+     .when(F.col("nodemetrics.nodeName") == "Scan csv", 0)
+     .when(F.col("nodemetrics.nodeName") == "Scan json", 0)
+     .when(F.col("nodemetrics.nodeName") == "PythonUDF", 0)
+     .when(F.col("nodemetrics.nodeName") == "ScalaUDF", 0)
+     .when(F.col("nodemetrics.nodeName") == "FlatMapGroupsInPandas", 0)
+     .when(F.col("nodemetrics.nodeName") == "DeserializeToObject", 0)
+     .when(F.col("nodemetrics.nodeName") == "SerializeFromObject", 0)
+     .otherwise(1)
+)
+
+# Step 3: Calculate job photon percentage (equivalent to jobcheck CTE)
+jobcheck_df = photoncheck_df.groupBy("cluster_name", "application_id") \
+                             .agg((F.sum("photonbinary") / F.count("*")).alias("jobphotonperc"))
+
+# Step 4: Final result with any_value equivalent
+result_df = jobcheck_df.groupBy("cluster_name", "application_id") \
+                       .agg(F.first("jobphotonperc").alias("jobphotonperc"))
+
+# Display the result
+display(result_df)
+
+# COMMAND ----------
+
+joined_df = cluster_summaries_df.join(applications_df, cluster_summaries_df.cluster_id == applications_df.cluster_id, how='right')
+final_df = joined_df.join(result_df, ['cluster_name'], how='inner')
+display(final_df)
