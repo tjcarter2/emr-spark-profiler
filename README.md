@@ -48,6 +48,10 @@ iii) Create a secret for DATAPLANE_DOMAIN_DBAUTH and then fetch token in code. Y
 - **`max_cluster_threads`**: Maximum number of concurrent clusters to analyze.
 - **`max_app_threads`**: Maximum number of concurrent application analyses per cluster.
 
+## EMR specific caveat
+
+For best accuracy and performance for the EMR spark observability profiler, we recommend settting the spark configs AWS recommends here (https://docs.aws.amazon.com/emr/latest/ManagementGuide/app-history-spark-UI.html) to allow for efficient parsing of large event logs.
+
 ## Contribution Guide
 
 TBD
